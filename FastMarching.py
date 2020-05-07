@@ -6,14 +6,11 @@ import matplotlib.pyplot as plt
 import logging 
 from itertools import product
 from constants import EPS
+from scipy import optimize
 
-fmmlogger=logging.getLogger("FastMarching")
-fmmlogger.setLevel(logging.DEBUG)
-ch = logging.StreamHandler()
-ch.setLevel(logging.WARN)
-ch.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-fmmlogger.handlers.clear()
-fmmlogger.addHandler(ch)
+from cubic import CubicInterpolate
+from constants import logger,ITMAX
+from closestTwo import closestTwo
 
 class FastMarching:
     """
@@ -42,7 +39,7 @@ class FastMarching:
     
     """
     def __init__(self,grid,T0,status,V=None,Fext=[]):
-        self.logger=logging.getLogger("FastMarching")
+        self.logger=logger
         
         self.grid=grid
         self.T0=T0
@@ -82,12 +79,12 @@ class FastMarching:
         loop update procedure until reach `vstop`
         """
         while(len(self.Tentative)>0):
-            _,(v,index)=heapq.heappop(self.Tentative)
+            _,(v,Fext,index)=heapq.heappop(self.Tentative)
             if self.Status[index]==0:
                 # 由于无法更新非Heap中元素的值，Tentative中存在过期的元素
                 if v>vstop:
                     break
-                self.n2k(index,v)
+                self.n2k(index,v,Fext)
                 self.updateNeibour(index)
     
     def updateNeibour(self,index):
@@ -98,23 +95,25 @@ class FastMarching:
             status=self.Status[neib]
             if status<1:
                 # Narrow band  or Far
-                t=self.compute(neib)
-                if np.isnan(t):
-                    self.logger.warning('nan get in compute distance of index=%s'%(repr(neib)))
-                elif abs(t)<abs(self.T[neib]):
-                    self.f2n(neib,t)
+                t,Fext=self.compute(neib)
+                self.f2n(neib,t,Fext)
 
-    def n2k(self,ptindex,v):
-        self.logger.info('n2k: index=%s,coords=%s,t=%f'%(ptindex,self.grid.coord(ptindex),v))
+    def n2k(self,ptindex,v,Fext):
         self.Status[ptindex]=1
         self.T[ptindex]=v
+        for i in range(len(self.Fext)):
+            self.Fext[i][ptindex]=Fext[i]
+        self.logger.info('n2k: index=%s,coords=%s,t=%f,Fext=%s'%(ptindex,self.grid.coord(ptindex),v,repr(Fext)))
         self.updateNeibour(ptindex)
     
-    def f2n(self,ptindex,v):
-        self.logger.info('f2n: index=%s,coords=%s,t=%f,old t=%f'%(repr(ptindex),self.grid.coord(ptindex),v,self.T[ptindex]))
-        self.Status[ptindex]=0
-        self.T[ptindex]=v
-        heapq.heappush(self.Tentative,(abs(v),(v,ptindex)))
+    def f2n(self,ptindex,v,Fext):
+        if np.isnan(v):
+            self.logger.warning('nan get in compute distance of index=%s'%(repr(ptindex)))
+        elif abs(v)<abs(self.T[ptindex]):
+            self.logger.info('f2n: index=%s,coords=%s,t=%f->%f,Fext=%s'%(repr(ptindex),self.grid.coord(ptindex),self.T[ptindex],v,repr(Fext)))
+            self.Status[ptindex]=0
+            self.T[ptindex]=v
+            heapq.heappush(self.Tentative,(abs(v),(v,Fext,ptindex)))
 
     def compute(self,index):
         """
@@ -132,31 +131,34 @@ class FastMarching:
         quadratic=[-1/self.velocity(index),0,0] # c,b,a for ax^2+bx+c=0
         
         # list of (+1 for right -1 for left, phi_1, delta_x)
-        dervCoffs,(tmin,tmax)=self.dervCoff(index)
-        """
-        """
-        neibs=[tuple((index[j]+dervCoffs[axis][0]*(j==axis) for j in range(ndim))) 
-                         for axis in range(ndim) if dervCoffs[axis][0]!=0]
-        neibCoffs=[self.dervCoff(neib)[0] for neib in neibs]
+        dervCoffs,(tmin,tmax)=self.upwindCoff(index)
+        neibs=None
+        neibCoffs=None
         for axis in range(ndim):
             if dervCoffs[axis][0]!=0:
-                dirct,k,b,d1,d2=dervCoffs[axis]
+                dirct,k,b,cfs=dervCoffs[axis]
                 quadratic[2]=quadratic[2]+k**2
                 quadratic[1]=quadratic[1]+2*k*b
                 quadratic[0]=quadratic[0]+b**2
             else:
                 pass
+                """
+                if neibs==None:
+                    neibs=[tuple((index[j]+dervCoffs[axis][0]*(j==axis) for j in range(ndim))) 
+                                for axis in range(ndim) if dervCoffs[axis][0]!=0 ]
+                    neibCoffs= [self.upwindCoff(neib)[0] for neib in neibs if grid.isPoint(neib)]
+                
                 # !!!! very important !!! improve the accuracy
                 md=max((cof[axis][1]*self.T[neib]+cof[axis][2])**2 for neib,cof in zip(neibs,neibCoffs))
                 self.logger.info("difference in axis=%d using %f: neibs=%s;neib coffs=%s;"%(axis,md,repr(neibs),repr(neibCoffs)))
-                
                 quadratic[0]=quadratic[0]+md
-            
+                """
+
         if quadratic[2]!=0:
             c,b,a=quadratic
             sgn=0 if abs((tmin+tmax)/2)<EPS else np.sign((tmin+tmax)/2)
             if b**2-4*a*c<-EPS:
-                t= max((-b/k+sgn*abs(1/k) for (dirct,k,b,d1,d2) in dervCoffs if dirct!=0),key=lambda x:abs(x))
+                t= max((-b/k+sgn*abs(1/k) for (dirct,k,b,_) in dervCoffs if dirct!=0),key=lambda x:abs(x))
             elif abs(b**2-4*a*c)<EPS:
                 t=-b/(2*a)
             else:
@@ -176,27 +178,30 @@ class FastMarching:
                         self.logger.error("index=%s,a=%f,b=%f,c=%f,tmin=%f,tmax=%f,t1=%f,t2=%f"%(repr(index),a,b,c,tmin,tmax,t1,t2))
                         raise ValueError('compute invalid point index=%s'%repr(index))
             
-            self.logger.debug("index=%s,derivate=%s,a=%f,b=%f,c=%f,tmin=%f,tmax=%f,t=%f"%(repr(index),repr(dervCoffs),
-                                a,b,c,tmin,tmax,t))
+            self.logger.debug("index=%s,t=%f,derivate=%s,a=%f,b=%f,c=%f,tmin=%f,tmax=%f"%(repr(index),t,repr(dervCoffs),
+                                a,b,c,tmin,tmax))
             
-            # extend the velocity in the front 
+            # extend the velocity in the front
+            Fext=[0.,]*len(self.Fext)
             for i in range(len(self.Fext)):
                 k,b=0.,0.
                 for axis in range(ndim):
-                    dirct,kj,bj,d1,d2=dervCoffs[axis]
-                    derv=(kj*t+bj)
+                    dirct,kj,bj,cfs=dervCoffs[axis]
+                    derv=kj*t+bj
                     if dirct!=0:
-                        v=self.Fext[i][tuple((index[j]+dirct*(j==axis) for j in range(ndim)))]
-                        k=k-derv/(dirct*d1)
-                        b=b+derv*v/(dirct*d1)
-                self.logger.debug("index=%s,d1=%f,k=%f,b=%f,Fext=%f"%(repr(index),d1,k,b,-b/k))
-                self.Fext[i][index]=-b/k
-            return t
+                        k=k+derv*cfs[0]
+                        b=b+derv*np.dot(cfs[1:],
+                            grid.upwindValues(index,axis,dirct,self.Fext[i],order=len(cfs)-1)[1:])
+
+                self.logger.debug("index=%s,k=%f,b=%f,Fext=%f"%(repr(index),k,b,-b/k))
+                if abs(b/k)<1e6:
+                    Fext[i]=-b/k
+            return t,Fext
         else:
-            self.logger.debug("index=%s,neibs=%s,equation=%s,quadratic=%s"%(repr(index),repr(neibs),repr(dervCoffs),repr(quadratic)))
+            self.logger.warn("index=%s,equation=%s,quadratic=%s"%(repr(index),repr(dervCoffs),repr(quadratic)))
             raise ValueError('compute invalid point index=%s'%repr(index))
     
-    def dervCoff(self,index,order=1):
+    def upwindCoff(self,index,order=2):
         """
         返回当前节点index 计算不同方向偏导的差分格式中的系数
         """
@@ -204,40 +209,28 @@ class FastMarching:
         ndim=grid.ndim
         coffes=[]
 
-        coords=grid.coord(index)
-        amin,amax=0.0,0.0
+        amin,amax=np.infty,-np.infty
         for axis in range(ndim):
-            dirct,k,b,d1,d2=0,0,0,np.infty,np.infty
-            0<=index[axis]+k<grid.shape[axis]
+            dirct,k,b,cfs=0,0,0,[]
             for j in (-1,1):
                 neib=tuple((index[k]+j*(k==axis) for k in range(ndim)))
-                kj,bj,dx1,dx2=0.,np.infty,0.,np.infty
-                if (0<=index[axis]+j<grid.shape[axis]) and self.Status[neib]==1:
-                    coords1,t1=self.pointInfo(neib)
-                    dx1=abs(coords1[axis]-coords[axis])
-                    kj,bj=-1/(j*dx1),t1/(j*dx1)
-                    amin=min(amin,t1)
-                    amax=max(amax,t1)
-                    if order==2:
-                        neib2=tuple((index[k]+2*j*(k==axis) for k in range(ndim)))
-                        if (0<=index[axis]+2*j<grid.shape[axis]) and self.Status[neib2]==1:
-                            coords2,t2=self.pointInfo(neib2)
-                            dx2=abs(coords2[axis]-coords1[axis])
-                            kj=kj-1/(j*(dx1+dx2))
-                            bj=bj+t1/(j*dx2)-(dx1/dx2)*(t2/(j*dx1+j*dx2))
-                    if (dirct==0) or (bj/kj)>(b/k):
-                        dirct,k,b,d1,d2=j,kj,bj,dx1,dx2            
-            coffes.append([dirct,k,b,d1,d2])
+                neib2=tuple((index[k]+2*j*(k==axis) for k in range(ndim)))
+                val=[]
+                if (0<=neib[axis]<grid.shape[axis]) and self.Status[neib]==1:
+                    val.append(self.T[neib])
+                    if (0<=neib2[axis]<grid.shape[axis]) and self.Status[neib2]==1:
+                        val.append(self.T[neib2])
+                    cfs=grid.upwindCoffs(index,axis,j,order=len(val))
+                    amin=min(amin,min(val))
+                    amax=max(amax,max(val))
+                    kj,bj=cfs[0],np.dot(cfs[1:],val)
+                    #kj,bj=-j*kj,-j*bj # gudonov scheme max(f^-,-f^+,0)
+                    if (dirct==0) or abs(bj/kj)>abs(b/k):
+                        # 等长
+                        dirct,k,b=j,kj,bj
+            coffes.append([dirct,k,b,cfs])
         return coffes,(amin,amax)
         
-    def pointInfo(self,ptindex):
-        """
-        返回节点index的坐标和T值
-        如果节点在外部，则返回边界点的坐标和位置
-        """
-        #index=tuple(min(max(n,0),self.grid.X.shape[i]-1) for i,n in enumerate(index))
-        return self.grid.coord(ptindex),self.T[ptindex]
-
 class ReinitializeFMM(FastMarching):
     """
     1. Chopp D L. Some improvements of the fast marching method[J]. SIAM Journal on Scientific Computing, 2001, 23(1): 230-244.
@@ -262,7 +255,7 @@ class ReinitializeFMM(FastMarching):
             xl,Fl=[],[]
         else:
             xl,Fl=extend['xl'],extend['Fl']
-        self.logger=logging.getLogger('Reinitialization')
+        self.logger=logger
         status,X,Fext=self.frontInitialize(grid,X,xl,Fl)
 
         super().__init__(grid,X,status,V=1.0,Fext=Fext)
@@ -279,89 +272,80 @@ class ReinitializeFMM(FastMarching):
 
         extend=len(Fl)>0
         Fext=[np.full(grid.shape,np.inf) for _ in range(len(Fl))]
-
+        
+        cub_T0=CubicInterpolate(grid,T0)
+        
         for vindex in product(*(range(grid.shape[i]-1) for i in range(ndim))):
             if np.any(np.isinf(T0[tuple(slice(ind,ind+2) for ind in vindex)])):
                 continue
             if grid.isSignChange(vindex,T0):
                 # sign changed
-                cof=grid.cubicCoff(vindex,T0)
                 for point in grid.voxelPoints(vindex):
                     status[point]=1
-                    d=self.cubicDistance(grid,T0,vindex,cof,grid.coord(point))
+                    #print(grid.coord(point))
+                    d=self.cubicDistance(cub_T0,grid.coord(point))
                     #print(point,d,T0[point],T[point])
                     T[point]=np.sign(T0[point])*min(d,np.abs(T[point]))
                     if extend:
                         # Ref.4 Eq.20
                         x=grid.coord(point)
-                        i1,x1,d1=None,None,np.infty
-                        i2,x2,d2=None,None,np.infty
-                        for i,pt in enumerate(xl):
-                            d=sum(((x[j]-pt[j])**2 for j in range(len(x))))**0.5
-                            if d<d1:
-                                i2,x2,d2=i1,x1,d1
-                                i1,x1,d1=i,pt,d
-                            elif d<d2:
-                                i2,x2,d2=i,pt,d
-                        
-                        a=sum(((x[j]-x1[j])**2 for j in range(len(x))))
-                        b=sum(((x[j]-x2[j])**2 for j in range(len(x))))
-                        c=sum(((x[j]-x1[j])*(x[j]-x2[j]) for j in range(len(x))))
-                        # (1-alpha)*x1+alpha*x2 is the closet 
-                        alpha=min(1,max(0,(a-c)/(a+b-2*c)))
+                        i1,i2,alpha=closestTwo(xl,x)
+                        x1,x2=xl[i1],xl[i2]
                         for i in range(len(Fext)):
                             Fext[i][point]=(1-alpha)*Fl[i][i1]+alpha*Fl[i][i2]
-                        self.logger.debug("point=%s,x=%s,x1=%s,x2=%s,alpha=%f,a=%f,b=%f,c=%f"%(repr(point),repr(x),repr(x1),repr(x2),alpha,a,b,c))
+                        self.logger.debug("point=%s,x=%s,x1=%s,x2=%s,alpha=%f"%(repr(point),repr(x),repr(x1),repr(x2),alpha))
         return status,T,Fext
 
-    def cubicDistance(self,grid,T0,vindex,cof,xs):
+    def cubicDistance(self,cub_T0:CubicInterpolate,xs):
         """
         Ref.1 Section 3.2
         """
+        grid=cub_T0.grid
         ndim=grid.ndim
-        
-        x0,x=np.array(xs),np.array(xs)
+
+        vindex=grid.locate(xs)
         bnds=grid.voxelBound(vindex)
         vol=np.prod([bnd[1]-bnd[0] for bnd in bnds])
-        
+
+        x0,x=np.array(xs),np.array(xs)
         cnt=0
+        """
+        # using `Conjugate Gradient Method` to solve minimum distance
+        def func(x):
+            xs=np.array(x[:-1])
+            a=x[-1]
+            p=cub_T0.interpolate(xs)[0]
+            return np.dot(x0-xs,x0-xs)+a**2*p**2
+        def jac(x):
+            xs=np.array(x[:-1])
+            a=x[-1]
+            dr=2*(xs-x0)
+            p,dp=cub_T0.interpolate(xs)
+            return np.concatenate([dr+(2*a**2*p)*np.asarray(dp),[2*a*p**2]])
+        
+        res=optimize.minimize(fun=func,jac=jac,method="CG",
+            x0=np.concatenate([x0,[0]]))
+        print(x0,res)
+        return np.sqrt(res.fun)
+        """
+
         while True:
-            # 是否在外部s
-            inside,index1=True,[]
-            for i in range(ndim):
-                inc=0 
-                if x[i]<bnds[i][0]-EPS:
-                    inc,inside=-1,False
-                elif x[i]>bnds[i][1]+EPS:
-                    inc,inside=1,False
-                index1.append(vindex[i]+inc)
-            
-            if inside:
-                f,derv=grid.cubicInterpolation(cof,vindex,x)
-            else:
-                cof1=grid.cubicCoff(index1,T0)
-                f,derv=grid.cubicInterpolation(cof1,index1,x)
-            
+            f,derv=cub_T0.interpolate(x)
             derv=np.array(derv)
             sqr=np.linalg.norm(derv)**2
-            
             dlt1=-f/sqr*derv
-            dlt2=(x0-x)-np.dot(x0-x,derv)/sqr*derv
-            #print(x0,x,f,derv,dlt1,dlt2)
-            
-            x=x+dlt1+dlt2
+            dlt2=0.0 #(x0-x)-np.dot(x0-x,derv)/sqr*derv
+            dx=dlt1+dlt2
+            x=x+dx
             cnt=cnt+1
-            if(np.linalg.norm(dlt1+dlt2)<(1e-3*vol)):
+            if(np.linalg.norm(dx)<(1e-3*vol)):
                 return np.linalg.norm(x-x0)
-            if cnt>20:
-                self.logger.warning('cubic distance while loop than 100 times %s -> %s'%(x0,x))
+            if cnt>ITMAX:
+                self.logger.warning('cubic distance loop %d times %s -> %s'%(ITMAX,x0,x))
                 return np.linalg.norm(x-x0)
-    
+        
 class ReorthFMM(FastMarching):
     """
-    $$
-    \nabla \phi \dot \nabla F=0
-    $$
     can be used to 
      1. extended velocity `F` on the grid points near the crack front into the rest of the domain
         in such a way that F is constant in the direction normal to the interface
@@ -408,17 +392,64 @@ class ExtendingVelocity(FastMarching):
     Ref.1 Section 3.3
     Ref.3 Section 3.1.2
     
+    xl
+    $$
+    \nabla \phi \dot \nabla F=0
+    $$
+
+    initial 
      the front velocity data are provided as a list of sample coordinates, Xl , and the corresponding front velocity vector, Fl.
       search for the two sample coordinates xl1 and xl2 closest to x,
           F_{ijk} =(1−\alpha)F_{l1} +\alpha F_{l2 }
+    
+    solving
+
     """
     def __init__(self,grid,phi,xl,Fl):
         self.grid=grid
         self.phi=phi
 
+        self.xl=xl
+        self.Fl=Fl
+        self.Fext=[np.zeros(self.grid.shape) for _  in range(len(Fl))]
+
+    def frontInitialize(self,T0):
+        xl,Fl=self.xl,self.Fl
+        grid=self.grid
+
+        ndim=grid.ndim
+        
+        status=np.full_like(T0,-1)
+        T=np.full(grid.shape,np.inf)
+
+        extend=len(Fl)>0
+        Fext=[np.full(grid.shape,np.inf) for _ in range(len(Fl))]
+
+        for vindex in product(*(range(grid.shape[i]-1) for i in range(ndim))):
+            if np.any(np.isinf(T0[tuple(slice(ind,ind+2) for ind in vindex)])):
+                continue
+            if grid.isSignChange(vindex,T0):
+                # sign changed
+                for point in grid.voxelPoints(vindex):
+                    status[point]=1
+                    # Ref.4 Eq.20
+                    x=grid.coord(point)
+                    
+                    i1,i2,alpha=closestTwo(xl,x)
+                    x1,x2=xl[i1],xl[i2]
+                    for i in range(len(Fext)):
+                        Fext[i][point]=(1-alpha)*Fl[i][i1]+alpha*Fl[i][i2]
+                    self.logger.debug("point=%s,x=%s,x1=%s,x2=%s,alpha=%f"%(repr(point),repr(x),repr(x1),repr(x2),alpha))
+
+    def upwind(self):
+        pass
+    
+    def loop(self,vstop=np.infty):
+        pass
 def test1D():
     grid1D=GridHex(np.linspace(-1,1,101))
     y=grid1D.X**2-0.25
+    exact=np.where(grid1D.X>0,grid1D.X-0.5,grid1D.X+0.5)
     reinit1D=ReinitializeFMM(grid1D,y,extend={"xl":[(-0.5,),(0.5,)],"Fl":[[-1,1],]})
     #reinit1D.Fext=[grid1D.X.copy(),]
     grid1D.plot(reinit1D.T)
@@ -439,8 +470,10 @@ def test1D():
 
 def test2D():
     #  2D
-    grid2D=GridHex(np.linspace(-1,1,101),np.linspace(-1,1,101))
+    grid2D=GridHex(np.linspace(-1,1,51),np.linspace(-1,1,51))
     phi=grid2D.X**2+grid2D.Y**2-0.25
+    exact=np.sqrt(phi+0.25)-0.5
+
     xl=[(0.5*np.cos(theta),0.5*np.sin(theta)) for theta in np.linspace(0,2*np.pi,101)]
     Fl=[[x for x,y in xl],[y for x,y in xl]]
     reinit2D=ReinitializeFMM(grid2D,phi,extend={"xl":xl,"Fl":Fl})
@@ -482,16 +515,17 @@ def test2D():
     grid2D.plot(reinit2D.Fext[0])
     plt.title('Fext[0]',fontsize=16)
     plt.axis('equal')
+    plt.clim(-0.5,0.5)
     plt.subplot(2,2,4)
     grid2D.plot(reinit2D.Fext[1])
     plt.title('Fext[1]',fontsize=16)
-    plt.axis('equal')  
+    plt.axis('equal')
     plt.show()
 
     plt.figure(figsize=(12,6))
     plt.suptitle('Error',fontsize=16)
     Z=reinit2D.T
-    Z0=np.sqrt(phi+0.25)-np.sqrt(0.25)
+    Z0=exact
     plt.subplot(1,2,1)
     grid2D.plot(np.where(reinit2D.Status>=0,Z-Z0,np.inf),title='Absolute Error of Fast Marching Method')
     plt.axis('equal')
@@ -502,10 +536,12 @@ def test2D():
     
     print(np.amax(Z[reinit2D.Status==1]))
 
-def test3D():
-    grid3D=GridHex(np.linspace(-1,1,21),np.linspace(-1,1,21),np.linspace(-1,1,21))
-    phi=grid3D.X**2+grid3D.Y**2+grid3D.Z**2-3*0.5**2
-    reinit3D=ReinitializeFMM(grid3D,phi)
+def test2D_1():
+    grid2d=GridHex(np.linspace(-1,1,41),np.linspace(-1,1,41))
+    phi=grid2d.X**2+grid2d.Y**2
+    xl=[(0,0),(0,0)]
+    Fl=[(0,0),(1,1)]
+    reinit2D=ReinitializeFMM(grid2d,phi,extend={"xl":xl,"Fl":Fl})
 
 def test2D1():
     grid=GridHex(np.linspace(-1,1,101),np.linspace(-1,1,101))
@@ -513,6 +549,12 @@ def test2D1():
     accept=np.abs(phi)<0.2
     fmm=FastMarching(grid,np.where(accept,phi,np.infty),
                     status=np.where(accept,1,-1)) 
+
+def test3D():
+    grid3D=GridHex(np.linspace(-1,1,21),np.linspace(-1,1,21),np.linspace(-1,1,21))
+    phi=grid3D.X**2+grid3D.Y**2+grid3D.Z**2-3*0.5**2
+    reinit3D=ReinitializeFMM(grid3D,phi)
+
 def test2D_xx():
     Nx,Ny=101,101
     grid=GridHex(np.linspace(-1,1,Nx),np.linspace(-1,1,Ny))
@@ -545,7 +587,7 @@ def test2D_line():
     plt.show()
 
 def test2D_zx():
-    grid=GridHex(np.linspace(-1,1,11),np.linspace(-1,1,11))
+    grid=GridHex(np.linspace(-1,1,51),np.linspace(-1,1,51))
     phi,psi=np.where(grid.X<=-0.1,(grid.X+grid.Y+0.1)/np.sqrt(2),grid.Y),grid.X
     accept=np.abs(phi)<0.2
     fmm=ReinitializeFMM(grid,phi)
@@ -560,7 +602,14 @@ if __name__=="__main__":
     #Fl=[[x for x,y in xl],[y for x,y in xl]]
     #reinit2D=ReinitializeFMM(grid2D,phi,extend={"xl":xl,"Fl":Fl})
     #reinit2D.loop(vstop=1.0)
+    
     #test1D()
 
-    test2D_line()
-    test2D_zx()
+    test2D()
+    #test2D1()
+    #test2D_1()
+    
+    #test2D_line()
+    #test2D_zx()
+
+    #test2D_xx()
