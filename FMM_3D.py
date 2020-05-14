@@ -8,14 +8,14 @@ import logging
 from constants import EPS
 
 from Grid import GridHex
-from FastMarching import FastMarching,ReinitializeFMM,isSignChange,closestTwo
+from FMM import FastMarching,ReinitializeFMM,isSignChange,closestTwo
 from cubic import CubicInterpolate
 from constants import logger,ITMAX
 
 def minmod(a,b):
     return a if abs(a)<=abs(b) else b
     
-class Crack3D_FMM(FastMarching):
+class FMM_3D(FastMarching):
     """
     1. Bærentzen J A. On the implementation of fast marching methods for 3D lattices[J]. 2001.
     2. Sukumar N, Chopp D L, Moran B. Extended finite element method and fast marching method for three-dimensional fatigue crack propagation[J]. Engineering Fracture Mechanics, 2003, 70(1): 29-48.
@@ -251,7 +251,7 @@ def test3D_line():
 
     vstop=1.0 # np.infty #
 
-    crack=Crack3D_FMM(grid,phi0,psi0)
+    crack=FMM_3D(grid,phi0,psi0)
     rho,Fext,phi_n1,psi_n1=crack.advanceFront(xl,Fl,dt=1.0,vstop=vstop)
 
     slc=(slice(None),slice(None),1)
@@ -282,7 +282,7 @@ def test3D_circle():
 
     vstop=np.infty #0.4 # 
 
-    crack=Crack3D_FMM(grid,phi0,psi0)
+    crack=FMM_3D(grid,phi0,psi0)
     rho,Fext,phi_n1,psi_n1=crack.advanceFront(xl,Fl,dt=1.0,vstop=vstop)
 
     slc=(slice(None),slice(None),1)
