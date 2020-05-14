@@ -223,9 +223,8 @@ class GridHex:
         """
         #考虑浮点数误差
         vals=X[tuple(slice(ind,ind+2) for ind in vindex)].flatten()
-        return np.abs(np.mean(np.where(np.abs(vals)>1e-13,
-                                       np.sign(vals),0)
-                             ))!=1
+        return np.all(np.isfinite(vals)) and np.abs(np.mean(np.where(np.abs(vals)>1e-13,
+                                       np.sign(vals),0)))!=1
     def isPoint(self,ptindex):
         """
         返回节点是否是内部节点
@@ -235,14 +234,16 @@ class GridHex:
     def coord(self,ptindex):
         return [seed[ind] for seed,ind in zip(self.seeds,ptindex)]
 
-    def neighbours(self,index):
+    def neighbours(self,index,order=1):
         """
         返回邻接节点的索引列表
         """
         ndim=self.ndim
-        return [tuple((index[k]+j*(k==i) for k in range(ndim))) 
-                        for i in range(ndim) for j in (-1,1) 
-                        if 0<=index[i]+j<self.shape[i]]
+        return [tuple((index[k]+j*l*(k==i) for k in range(ndim))) 
+                        for i in range(ndim) 
+                        for j in (-1,1) 
+                        for l in range(1,order+1)
+                        if 0<=index[i]+j*l<self.shape[i]]
 
     def adjacent(self,ptindex,axis,N=1):
         """

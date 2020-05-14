@@ -9,9 +9,38 @@ from constants import EPS
 from scipy import optimize
 
 from cubic import CubicInterpolate
-from constants import logger,ITMAX
-from closestTwo import closestTwo
+from constants import logger,ITMAX,APPR_ORDER
 
+def closestTwo(xl,x):
+    """
+    寻找xl中最靠近x的两个点x1,x2的下标i1,i2
+    并返回 在x1,x2的线段上距离最接近 x的点所占比例 $(1-alpha)*x1+alpha*x2$
+
+    Reference: 
+    1. Three‐dimensional non‐planar crack growth by a coupled extended finite element and fast marching method
+        3.1.2. Extending the tip velocity
+    """
+    i1,d1=None,np.infty
+    i2,d2=None,np.infty
+    for i,pt in enumerate(xl):
+        d=sum(((x[j]-pt[j])**2 for j in range(len(x))))**0.5
+        if d<d1:
+            i2,d2=i1,d1
+            i1,d1=i,d
+        elif d<d2:
+            i2,d2=i,d
+    x1,x2=xl[i1],xl[i2]
+    a=sum(((x[j]-x1[j])**2 for j in range(len(x))))
+    b=sum(((x[j]-x2[j])**2 for j in range(len(x))))
+    c=sum(((x[j]-x1[j])*(x[j]-x2[j]) for j in range(len(x))))
+    # (1-alpha)*x1+alpha*x2 is the closet 
+    alpha=min(1,max(0,(a-c)/(a+b-2*c)))
+    return i1,i2,alpha
+
+def isSignChange(vals,EPS=1e-13):
+    return  np.all(np.isfinite(vals)) and \
+            np.abs(np.mean(np.where(np.abs(vals)>EPS,
+                                       np.sign(vals),0)))!=1
 class FastMarching:
     """
     1. Bærentzen J A. On the implementation of fast marching methods for 3D lattices[J]. 2001.
@@ -39,16 +68,32 @@ class FastMarching:
     
     """
     def __init__(self,grid,T0,status,V=None,Fext=[]):
+        """
+        Parameters
+        _______
+        grid: GridHex
+            Structure Geometry Grid
+        T0  : 
+            Accepted Nodes Values
+        status: 
+            Node Status : 1 for all accepted nodes
+        V   : 
+            velocity at nodes
+        Fext:
+            List of extended Field
+        """
         self.logger=logger
         
         self.grid=grid
         self.T0=T0
-        self.T=np.where(status==1,T0,np.inf) #np.sign(T0)*
+        self.T=np.where(status==1,T0,np.inf) 
         
         # Velocity 
         self.V=V
         # Extend Field
         self.Fext=Fext
+
+        self.CNT=np.zeros_like(T0,dtype=np.int8)
 
         # status of each grid points : 
         #   -1 for Distant : also know as Far, far from the initial interface to be possible candidates for 
@@ -61,6 +106,12 @@ class FastMarching:
         self.Tentative=[]
         heapq.heapify(self.Tentative)
         
+        for index in np.argwhere(status==1):
+            index=tuple(index)  
+            self.logger.info("Front Initialize: index=%s,coordinate=%s,t=%f,Fext=%s"%(
+                repr(index),repr(grid.coord(index)),T0[index],
+                repr([Fext[i][index] for i in range(len(Fext))])))
+
         self.initialize()
             
     def velocity(self,index):
@@ -70,14 +121,29 @@ class FastMarching:
             return self.V if np.isscalar(self.V) else self.V[index]
 
     def initialize(self):
+        """
+        Initialize points near the  accepted points
+        """
+        hq=[]
+        heapq.heapify(hq)
+
+        """
+        先计算距离偏小的点的
+        """
         for index in np.argwhere(self.Status==1):
             index=tuple(index)
+            heapq.heappush(hq,(self.T[index],index))
+        
+        while(len(hq)>0):
+            _,index=heapq.heappop(hq)
             self.updateNeibour(index)
     
     def loop(self,vstop=np.infty):
         """
-        loop update procedure until reach `vstop`
+        loop update procedure caculate the arriave Time T
+        until reach `vstop`
         """
+        self.logger.info("Loop Start")
         while(len(self.Tentative)>0):
             _,(v,Fext,index)=heapq.heappop(self.Tentative)
             if self.Status[index]==0:
@@ -86,38 +152,46 @@ class FastMarching:
                     break
                 self.n2k(index,v,Fext)
                 self.updateNeibour(index)
+        self.logger.info("Loop End")
     
     def updateNeibour(self,index):
         """
         updat each  neighbour of `index`
         """
-        for neib in self.grid.neighbours(index):
+        for neib in self.grid.neighbours(index,order=1):
             status=self.Status[neib]
             if status<1:
                 # Narrow band  or Far
                 t,Fext=self.compute(neib)
-                self.f2n(neib,t,Fext)
+                if not (t is None):
+                    self.f2n(neib,t,Fext)
 
     def n2k(self,ptindex,v,Fext):
-        self.Status[ptindex]=1
+        """
+        move narrow band node to accepted
+        """
         self.T[ptindex]=v
         for i in range(len(self.Fext)):
             self.Fext[i][ptindex]=Fext[i]
+        self.Status[ptindex]=1
         self.logger.info('n2k: index=%s,coords=%s,t=%f,Fext=%s'%(ptindex,self.grid.coord(ptindex),v,repr(Fext)))
-        self.updateNeibour(ptindex)
     
     def f2n(self,ptindex,v,Fext):
+        """
+        move far node to narrow band
+        """
         if np.isnan(v):
             self.logger.warning('nan get in compute distance of index=%s'%(repr(ptindex)))
         elif abs(v)<abs(self.T[ptindex]):
-            self.logger.info('f2n: index=%s,coords=%s,t=%f->%f,Fext=%s'%(repr(ptindex),self.grid.coord(ptindex),self.T[ptindex],v,repr(Fext)))
-            self.Status[ptindex]=0
             self.T[ptindex]=v
             heapq.heappush(self.Tentative,(abs(v),(v,Fext,ptindex)))
+            self.Status[ptindex]=0
+            self.logger.info('f2n: index=%s,coords=%s,t=%f->%f,Fext=%s'%(repr(ptindex),self.grid.coord(ptindex),self.T[ptindex],v,repr(Fext)))
 
     def compute(self,index):
         """
-        compute the distance of the voxel 
+        compute the arrive time of the point `index`
+        
         Ref.1. Appendix A: Pseudo Code
         Ref.2. Section 3: Fast Marching Method (7a),(7b)
         Ref.3. Section 5:  Higher-Accuracy Fast Marching Methods
@@ -132,6 +206,12 @@ class FastMarching:
         
         # list of (+1 for right -1 for left, phi_1, delta_x)
         dervCoffs,(tmin,tmax)=self.upwindCoff(index)
+        
+        nd=sum(abs(X[0]) for X in  dervCoffs)
+        if self.CNT[index]==nd:
+            return None,None
+        self.CNT[index]=nd
+
         neibs=None
         neibCoffs=None
         for axis in range(ndim):
@@ -143,6 +223,7 @@ class FastMarching:
             else:
                 pass
                 """
+                # 针对线段裂纹的修正，不建议使用
                 if neibs==None:
                     neibs=[tuple((index[j]+dervCoffs[axis][0]*(j==axis) for j in range(ndim))) 
                                 for axis in range(ndim) if dervCoffs[axis][0]!=0 ]
@@ -199,15 +280,18 @@ class FastMarching:
             return t,Fext
         else:
             self.logger.warn("index=%s,equation=%s,quadratic=%s"%(repr(index),repr(dervCoffs),repr(quadratic)))
-            raise ValueError('compute invalid point index=%s'%repr(index))
+            return None,None
+            #raise ValueError('compute invalid point index=%s'%repr(index))
     
-    def upwindCoff(self,index,order=2):
+    def upwindCoff(self,index):
         """
-        返回当前节点index 计算不同方向偏导的差分格式中的系数
+        计算当前节点index 不同方向偏导的差分格式中的系数
         """
         grid=self.grid
         ndim=grid.ndim
         coffes=[]
+
+        order=APPR_ORDER
 
         amin,amax=np.infty,-np.infty
         for axis in range(ndim):
@@ -218,8 +302,9 @@ class FastMarching:
                 val=[]
                 if (0<=neib[axis]<grid.shape[axis]) and self.Status[neib]==1:
                     val.append(self.T[neib])
-                    if (0<=neib2[axis]<grid.shape[axis]) and self.Status[neib2]==1:
-                        val.append(self.T[neib2])
+                    if order>=2:
+                        if (0<=neib2[axis]<grid.shape[axis]) and self.Status[neib2]==1:
+                            val.append(self.T[neib2])
                     cfs=grid.upwindCoffs(index,axis,j,order=len(val))
                     amin=min(amin,min(val))
                     amax=max(amax,max(val))
@@ -265,35 +350,39 @@ class ReinitializeFMM(FastMarching):
         reconstruct process provides local tricubic approximation 
         of the initial conditions on grid points near the crack front
         """
+        self.logger.info("Front Initialize Start")
         ndim=grid.ndim
         
-        status=np.full_like(T0,-1)
+        status=np.full(T0.shape,-1)
         T=np.full(grid.shape,np.inf)
 
         extend=len(Fl)>0
         Fext=[np.full(grid.shape,np.inf) for _ in range(len(Fl))]
         
         cub_T0=CubicInterpolate(grid,T0)
-        
+
         for vindex in product(*(range(grid.shape[i]-1) for i in range(ndim))):
-            if np.any(np.isinf(T0[tuple(slice(ind,ind+2) for ind in vindex)])):
+            vals=grid.voxelValues(vindex,T0)
+            if not np.all(np.isfinite(vals)):
                 continue
-            if grid.isSignChange(vindex,T0):
+            if isSignChange(vals):
                 # sign changed
+                self.logger.debug("voxel %s : val=%s "%(repr(vindex),repr(vals)))
                 for point in grid.voxelPoints(vindex):
-                    status[point]=1
-                    #print(grid.coord(point))
-                    d=self.cubicDistance(cub_T0,grid.coord(point))
-                    #print(point,d,T0[point],T[point])
+                    x=grid.coord(point)
+                    d=self.cubicDistance(cub_T0,x)
+                    if not np.isfinite(d):
+                        self.logger.warning("voxel %s cubic distance is wrong!"%(repr(vindex)))
+                        break
+                    
                     T[point]=np.sign(T0[point])*min(d,np.abs(T[point]))
                     if extend:
                         # Ref.4 Eq.20
-                        x=grid.coord(point)
                         i1,i2,alpha=closestTwo(xl,x)
-                        x1,x2=xl[i1],xl[i2]
                         for i in range(len(Fext)):
                             Fext[i][point]=(1-alpha)*Fl[i][i1]+alpha*Fl[i][i2]
-                        self.logger.debug("point=%s,x=%s,x1=%s,x2=%s,alpha=%f"%(repr(point),repr(x),repr(x1),repr(x2),alpha))
+                    status[point]=1
+        self.logger.info("Front initialize End!")
         return status,T,Fext
 
     def cubicDistance(self,cub_T0:CubicInterpolate,xs):
@@ -419,26 +508,26 @@ class ExtendingVelocity(FastMarching):
 
         ndim=grid.ndim
         
-        status=np.full_like(T0,-1)
+        status=np.full(T0.shape,-1)
         T=np.full(grid.shape,np.inf)
 
         extend=len(Fl)>0
         Fext=[np.full(grid.shape,np.inf) for _ in range(len(Fl))]
 
         for vindex in product(*(range(grid.shape[i]-1) for i in range(ndim))):
-            if np.any(np.isinf(T0[tuple(slice(ind,ind+2) for ind in vindex)])):
+            vals=grid.voxelValues(vindex,T0)
+            if not np.all(np.isfinite(vals)):
                 continue
-            if grid.isSignChange(vindex,T0):
+            if isSignChange(vals):
                 # sign changed
                 for point in grid.voxelPoints(vindex):
-                    status[point]=1
                     # Ref.4 Eq.20
                     x=grid.coord(point)
-                    
                     i1,i2,alpha=closestTwo(xl,x)
                     x1,x2=xl[i1],xl[i2]
                     for i in range(len(Fext)):
                         Fext[i][point]=(1-alpha)*Fl[i][i1]+alpha*Fl[i][i2]
+                    status[point]=1
                     self.logger.debug("point=%s,x=%s,x1=%s,x2=%s,alpha=%f"%(repr(point),repr(x),repr(x1),repr(x2),alpha))
 
     def upwind(self):
@@ -559,7 +648,7 @@ def test2D_xx():
     Nx,Ny=101,101
     grid=GridHex(np.linspace(-1,1,Nx),np.linspace(-1,1,Ny))
     index=(0,0)
-    X=np.full_like(grid.X,np.inf)
+    X=np.full(grid.shape,np.inf)
     status=np.full((Nx,Ny),-1,dtype=np.int8)
 
     theta=np.pi/4

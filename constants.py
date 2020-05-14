@@ -1,5 +1,8 @@
 # -*- coding: UTF-8 -*-
 
+#  first or second order approximations
+APPR_ORDER=1
+
 # 
 EPS=1e-10
 
@@ -30,8 +33,11 @@ VoxelPointOrder={
 import logging
 logger=logging.getLogger("XFEM")
 logger.setLevel(logging.DEBUG)
-ch = logging.FileHandler("./FastMarching.txt",mode="w")
+ch = logging.FileHandler("./FastMarching.log",mode="w")
 ch.setLevel(logging.DEBUG)
 ch.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 logger.handlers.clear()
 logger.addHandler(ch)
+
+import numpy as np
+np.set_printoptions(linewidth=np.nan)
